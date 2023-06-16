@@ -12,10 +12,15 @@
 // You can also visit the nRF DeviceTree extension documentation at https: //nrfconnect.github.io/vscode-nrf-connect/devicetree/nrfdevicetree.html
 &i2c0 {
 
-    mysensor: mysensor@4a {
+    keyboard: mysensor@4a {
         compatible = "i2c-device";
         status = "okay";
         reg = <0x34>;
+    };
+    temp_hum: mysensor1@4a{
+        compatible = "i2c-device";
+        status = "okay";
+        reg = < 0x40 >;
     };
 };
 

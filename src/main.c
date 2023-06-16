@@ -25,6 +25,8 @@
 #include <dk_buttons_and_leds.h>
 
 #include "app_nfc.h"
+
+#include "ble_char.h"
 /*1*/
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
@@ -147,6 +149,11 @@ extern const uint8_t alp_d;
 extern const uint8_t star;
 extern const uint8_t hash;/*2*/
 extern int cond ;
+int cTemp;
+int ble_temp ;
+int humidity;
+int ble_hum ;
+int timer_val=10;
 /*3*/
 /* Current report status
  */
@@ -983,6 +990,26 @@ static void bas_notify(void)
 	bt_bas_set_battery_level(battery_level);
 }
 
+void tcp_work_handler(struct k_work *work)
+{
+	/* do the processing that needs to be done periodically */
+	si7006();
+	ble_temp = cTemp * 100;
+	ble_hum = humidity * 100;
+	hum_notify();
+	temp_notify();
+}
+
+K_WORK_DEFINE(tcp_work, tcp_work_handler);
+void tcp_timer_handler(struct k_timer *dummy)
+{
+	k_work_submit(&tcp_work);
+}
+
+struct k_timer tcp_timer;
+
+
+
 void main(void)
 {
 	int err;
@@ -1030,11 +1057,16 @@ void main(void)
 #endif
 
 	k_work_init(&pairing_work, pairing_process);
-
 	keypad_init();
+	
 
+	k_timer_init(&tcp_timer, tcp_timer_handler, NULL);
+	k_timer_start(&tcp_timer, K_SECONDS(0), K_SECONDS(timer_val));
 	for (;;)
 	{
+		
+		
+	
 		
 		 bas_notify();
 	if(cond == 1)
@@ -1049,6 +1081,8 @@ void main(void)
 		}
 		kp_i2c_write(0x34, 0x02, 0x01);
 	}
+	
+
 		k_sleep(K_MSEC(10));
 	}
 	} 

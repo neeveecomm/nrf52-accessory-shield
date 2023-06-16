@@ -40,7 +40,7 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 
 
 
-#define I2C_NODE DT_NODELABEL(mysensor)
+#define I2C_NODE DT_NODELABEL(keyboard)
 static const struct i2c_dt_spec dev_i2c = I2C_DT_SPEC_GET(I2C_NODE);
 
 uint8_t kp_i2c_read(uint8_t slaveAddr, uint8_t regAddr)
