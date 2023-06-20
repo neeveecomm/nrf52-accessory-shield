@@ -9,7 +9,7 @@
 #define     SI7006_MEASURE_RELATIVE_HUMIDITY_NO_HOLD_MASTER_MODE           0xF5               
 #define     SI7006_MEASURE_TEMPERATURE_NO_HOLD_MASTER_MODE                 0xF3               
 #define I2C_NODE DT_NODELABEL(temp_hum)
- struct i2c_dt_spec dev_i2c = I2C_DT_SPEC_GET(I2C_NODE);
+ struct i2c_dt_spec dev_i2c1 = I2C_DT_SPEC_GET(I2C_NODE);
 
 extern int cTemp;
 extern int ble_temp ;
@@ -23,14 +23,14 @@ void tt_i2c_write(uint8_t slaveAddr, uint8_t regAddr)
 
 	buf[0] = regAddr;
 	//buf[1] = 0;
-	 i2c_write_dt(&dev_i2c, buf, sizeof(buf));
+	 i2c_write_dt(&dev_i2c1, buf, sizeof(buf));
 	return ;
 }
 
 uint8_t tt_i2c_read(uint8_t slaveAddr)
 {
 	uint8_t data;
-	i2c_read_dt(&dev_i2c, &data, sizeof(data));
+	i2c_read_dt(&dev_i2c1, &data, sizeof(data));
 	return data;
 }
 
@@ -111,9 +111,9 @@ void MEASURE_RELATIVE_HUMIDITY_NO_HOLD_MASTER_MODE (void)
 
 void si7006(void)
 {
- if (!device_is_ready(dev_i2c.bus))
+ if (!device_is_ready(dev_i2c1.bus))
 	{
-		printk("I2C bus %s is not ready!\n\r", dev_i2c.bus->name);
+		printk("I2C bus %s is not ready!\n\r", dev_i2c1.bus->name);
 		return;
 	}
 	 MEASURE_RELATIVE_HUMIDITY_NO_HOLD_MASTER_MODE ();

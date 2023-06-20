@@ -22,6 +22,16 @@
         status = "okay";
         reg = < 0x40 >;
     };
+    colour_sen: mysensor2@4a{
+        compatible = "i2c-device";
+        status = "okay";
+        reg = < 0x38 >;
+    };
+    digitaltoanalog: mysensor3@4a{
+        compatible = "i2c-device";
+        status = "okay";
+        reg = < 0x64 >;
+    };
 };
 
 / {

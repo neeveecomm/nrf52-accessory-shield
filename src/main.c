@@ -154,6 +154,7 @@ int ble_temp ;
 int humidity;
 int ble_hum ;
 int timer_val=10;
+
 /*3*/
 /* Current report status
  */
@@ -1058,17 +1059,22 @@ void main(void)
 
 	k_work_init(&pairing_work, pairing_process);
 	keypad_init();
+	colour();
 	
-
+	
 	k_timer_init(&tcp_timer, tcp_timer_handler, NULL);
 	k_timer_start(&tcp_timer, K_SECONDS(0), K_SECONDS(timer_val));
 	for (;;)
 	{
-		
-		
-	
-		
-		 bas_notify();
+	bas_notify();
+	RGB_DATA_FOR_READ();
+	k_sleep(K_MSEC(1000));
+	clear_notify();
+	green_notify();
+	blue_notify();
+	red_notify();
+	dac_main();
+	k_sleep(K_MSEC(3000));
 	if(cond == 1)
 	{	
 		// printf("entered for loop");
@@ -1082,7 +1088,7 @@ void main(void)
 		kp_i2c_write(0x34, 0x02, 0x01);
 	}
 	
-
+		
 		k_sleep(K_MSEC(10));
 	}
 	} 

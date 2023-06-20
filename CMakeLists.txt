@@ -15,6 +15,8 @@ target_sources(app PRIVATE src/keypad.c)
 target_sources(app PRIVATE src/si7006.c)
 target_sources(app PRIVATE src/ble_char.c)
 target_sources(app PRIVATE src/app_nfc.c)
+target_sources(app PRIVATE src/colur_sensor.c)
+target_sources(app PRIVATE src/dac.c)
 # NORDIC SDK APP END
 
 zephyr_library_include_directories(${ZEPHYR_BASE}/samples/bluetooth)
