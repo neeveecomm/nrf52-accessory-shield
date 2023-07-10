@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2018 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
 
 #include <zephyr/types.h>
 #include <stddef.h>
@@ -9,7 +14,6 @@
 #include <zephyr/drivers/gpio.h>
 #include <soc.h>
 #include <assert.h>
-#include <zephyr/spinlock.h>
 
 #include <zephyr/settings/settings.h>
 
@@ -23,91 +27,95 @@
 #include <bluetooth/services/hids.h>
 #include <zephyr/bluetooth/services/dis.h>
 #include <dk_buttons_and_leds.h>
+#include <stdlib.h>
 
-#include "app_nfc.h"
-
-#include "ble_char.h"
-/*1*/
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
 #define BASE_USB_HID_SPEC_VERSION 0x0101
 
-#define OUTPUT_REPORT_MAX_LEN 1
-#define OUTPUT_REPORT_BIT_MASK_CAPS_LOCK 0x02
-#define INPUT_REP_KEYS_REF_ID 1
-#define OUTPUT_REP_KEYS_REF_ID 1
-#define MODIFIER_KEY_POS 0
-#define SCAN_CODE_POS 2
-#define KEYS_MAX_LEN (INPUT_REPORT_KEYS_MAX_LEN - \
-					  SCAN_CODE_POS)
+/* Number of pixels by which the cursor is moved when a button is pushed. */
+#define MOVEMENT_SPEED 5
+/* Number of input reports in this application. */
+#define INPUT_REPORT_COUNT 3
+/* Length of Mouse Input Report containing button data. */
+#define INPUT_REP_BUTTONS_LEN 3
+/* Length of Mouse Input Report containing movement data. */
+#define INPUT_REP_MOVEMENT_LEN 3
+/* Length of Mouse Input Report containing media player data. */
+#define INPUT_REP_MEDIA_PLAYER_LEN 1
+/* Index of Mouse Input Report containing button data. */
+#define INPUT_REP_BUTTONS_INDEX 0
+/* Index of Mouse Input Report containing movement data. */
+#define INPUT_REP_MOVEMENT_INDEX 1
+/* Index of Mouse Input Report containing media player data. */
+#define INPUT_REP_MPLAYER_INDEX 2
+/* Id of reference to Mouse Input Report containing button data. */
+#define INPUT_REP_REF_BUTTONS_ID 1
+/* Id of reference to Mouse Input Report containing movement data. */
+#define INPUT_REP_REF_MOVEMENT_ID 2
+/* Id of reference to Mouse Input Report containing media player data. */
+#define INPUT_REP_REF_MPLAYER_ID 3
 
-#define ADV_LED_BLINK_INTERVAL 1000
+/* HIDs queue size. */
+#define HIDS_QUEUE_SIZE 100
 
+/* Key used to move cursor left */
+#define KEY_LEFT_MASK DK_BTN1_MSK
+/* Key used to move cursor up */
+#define KEY_UP_MASK DK_BTN2_MSK
+/* Key used to move cursor right */
+#define KEY_RIGHT_MASK DK_BTN3_MSK
+/* Key used to move cursor down */
+#define KEY_DOWN_MASK DK_BTN4_MSK
 
-/*2*/
 /* Key used to accept or reject passkey value */
 #define KEY_PAIRING_ACCEPT DK_BTN1_MSK
 #define KEY_PAIRING_REJECT DK_BTN2_MSK
 
+uint16_t x_axis;
+uint16_t y_axis;
 
-/* HIDs queue elements. */
-#define HIDS_QUEUE_SIZE 10
+uint16_t x_value;
+uint16_t y_value;
 
-/* ********************* */
-/* Buttons configuration */
+bool right;
+bool left;
+bool up;
+bool down;
 
-/* Note: The configuration below is the same as BOOT mode configuration
- * This simplifies the code as the BOOT mode is the same as REPORT mode.
- * Changing this configuration would require separate implementation of
- * BOOT mode report generation.
- */
-#define KEY_CTRL_CODE_MIN 224 /* Control key codes - required 8 of them */
-#define KEY_CTRL_CODE_MAX 231 /* Control key codes - required 8 of them */
-#define KEY_CODE_MIN 0		  /* Normal key codes */
-#define KEY_CODE_MAX 101	  /* Normal key codes */
-#define KEY_PRESS_MAX 6		  /* Maximum number of non-control keys \
-							   * pressed simultaneously             \
-							   */
-
-/* Number of bytes in key report
- *
- * 1B - control keys
- * 1B - reserved
- * rest - non-control keys
- */
-#define INPUT_REPORT_KEYS_MAX_LEN (1 + 1 + KEY_PRESS_MAX)
+// extern int flag ;
+int16_t x_val_def;
+int16_t y_val_def;
 
 
-/* Current report map construction requires exactly 8 buttons */
-BUILD_ASSERT((KEY_CTRL_CODE_MAX - KEY_CTRL_CODE_MIN) + 1 == 8);
-
-/* OUT report internal indexes.
- *
- * This is a position in internal report table and is not related to
- * report ID.
- */
-enum
-{
-	OUTPUT_REP_KEYS_IDX = 0
-};
-
-/* INPUT report internal indexes.
- *
- * This is a position in internal report table and is not related to
- * report ID.
- */
-enum
-{
-	INPUT_REP_KEYS_IDX = 0
-};
 
 /* HIDS instance. */
 BT_HIDS_DEF(hids_obj,
-			OUTPUT_REPORT_MAX_LEN,
-			INPUT_REPORT_KEYS_MAX_LEN);
+			INPUT_REP_BUTTONS_LEN,
+			INPUT_REP_MOVEMENT_LEN,
+			INPUT_REP_MEDIA_PLAYER_LEN);
 
-static volatile bool is_adv;
+static struct k_work hids_work;
+struct mouse_pos
+{
+	int16_t x_val;
+	int16_t y_val;
+};
+
+/* Mouse movement queue. */
+K_MSGQ_DEFINE(hids_queue,
+			  sizeof(struct mouse_pos),
+			  HIDS_QUEUE_SIZE,
+			  4);
+
+#if CONFIG_BT_DIRECTED_ADVERTISING
+/* Bonded address queue. */
+K_MSGQ_DEFINE(bonds_queue,
+			  sizeof(bt_addr_le_t),
+			  CONFIG_BT_MAX_PAIRED,
+			  4);
+#endif
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE,
@@ -128,45 +136,7 @@ static struct conn_mode
 	bool in_boot_mode;
 } conn_mode[CONFIG_BT_HIDS_MAX_CLIENT_COUNT];
 
-
-
-static const uint8_t shift_key[] = {224};
-
-extern const uint8_t mute;
-extern const uint8_t up;
-extern const uint8_t back;
-extern const uint8_t left;
-extern const uint8_t enter;
-extern const uint8_t right;
-extern const uint8_t volume_down;
-extern const uint8_t down;
-extern const uint8_t volume_up;
-extern const uint8_t zero;
-extern const uint8_t alp_a;
-extern const uint8_t alp_b;
-extern const uint8_t alp_c;
-extern const uint8_t alp_d;
-extern const uint8_t star;
-extern const uint8_t hash;/*2*/
-extern int cond ;
-int cTemp;
-int ble_temp ;
-int humidity;
-int ble_hum ;
-int timer_val=10;
-
-/*3*/
-/* Current report status
- */
-static struct keyboard_state
-{
-	uint8_t ctrl_keys_state; /* Current keys state */
-	uint8_t keys_state[KEY_PRESS_MAX];
-} hid_keyboard_state;
-
-#if CONFIG_NFC_OOB_PAIRING
 static struct k_work adv_work;
-#endif
 
 static struct k_work pairing_work;
 struct pairing_data_mitm
@@ -180,61 +150,92 @@ K_MSGQ_DEFINE(mitm_queue,
 			  CONFIG_BT_HIDS_MAX_CLIENT_COUNT,
 			  4);
 
-static void advertising_start(void)
+#if CONFIG_BT_DIRECTED_ADVERTISING
+static void bond_find(const struct bt_bond_info *info, void *user_data)
 {
 	int err;
-	struct bt_le_adv_param *adv_param = BT_LE_ADV_PARAM(
-		BT_LE_ADV_OPT_CONNECTABLE |
-			BT_LE_ADV_OPT_ONE_TIME,
-		BT_GAP_ADV_FAST_INT_MIN_2,
-		BT_GAP_ADV_FAST_INT_MAX_2,
-		NULL);
 
-	err = bt_le_adv_start(adv_param, ad, ARRAY_SIZE(ad), sd,
-						  ARRAY_SIZE(sd));
+	/* Filter already connected peers. */
+	for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
+	{
+		if (conn_mode[i].conn)
+		{
+			const bt_addr_le_t *dst =
+				bt_conn_get_dst(conn_mode[i].conn);
+
+			if (!bt_addr_le_cmp(&info->addr, dst))
+			{
+				return;
+			}
+		}
+	}
+
+	err = k_msgq_put(&bonds_queue, (void *)&info->addr, K_NO_WAIT);
 	if (err)
 	{
-		if (err == -EALREADY)
-		{
-			printk("Advertising continued\n");
-		}
-		else
-		{
-			printk("Advertising failed to start (err %d)\n", err);
-		}
-
-		return;
+		printk("No space in the queue for the bond.\n");
 	}
-
-	is_adv = true;
-	printk("Advertising successfully started\n");
-}
-
-#if CONFIG_NFC_OOB_PAIRING
-static void delayed_advertising_start(struct k_work *work)
-{
-	advertising_start();
-}
-
-void nfc_field_detected(void)
-{
-	dk_set_led_on(NFC_LED);
-
-	for (int i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
-	{
-		if (!conn_mode[i].conn)
-		{
-			k_work_submit(&adv_work);
-			break;
-		}
-	}
-}
-
-void nfc_field_lost(void)
-{
-	dk_set_led_off(NFC_LED);
 }
 #endif
+
+static void advertising_continue(void)
+{
+	struct bt_le_adv_param adv_param;
+
+#if CONFIG_BT_DIRECTED_ADVERTISING
+	bt_addr_le_t addr;
+
+	if (!k_msgq_get(&bonds_queue, &addr, K_NO_WAIT))
+	{
+		char addr_buf[BT_ADDR_LE_STR_LEN];
+
+		adv_param = *BT_LE_ADV_CONN_DIR(&addr);
+		adv_param.options |= BT_LE_ADV_OPT_DIR_ADDR_RPA;
+
+		int err = bt_le_adv_start(&adv_param, NULL, 0, NULL, 0);
+
+		if (err)
+		{
+			printk("Directed advertising failed to start\n");
+			return;
+		}
+
+		bt_addr_le_to_str(&addr, addr_buf, BT_ADDR_LE_STR_LEN);
+		printk("Direct advertising to %s started\n", addr_buf);
+	}
+	else
+#endif
+	{
+		int err;
+
+		adv_param = *BT_LE_ADV_CONN;
+		adv_param.options |= BT_LE_ADV_OPT_ONE_TIME;
+		err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad),
+							  sd, ARRAY_SIZE(sd));
+		if (err)
+		{
+			printk("Advertising failed to start (err %d)\n", err);
+			return;
+		}
+
+		printk("Regular advertising started\n");
+	}
+}
+
+static void advertising_start(void)
+{
+#if CONFIG_BT_DIRECTED_ADVERTISING
+	k_msgq_purge(&bonds_queue);
+	bt_foreach_bond(BT_ID_DEFAULT, bond_find, NULL);
+#endif
+
+	k_work_submit(&adv_work);
+}
+
+static void advertising_process(struct k_work *work)
+{
+	advertising_continue();
+}
 
 static void pairing_process(struct k_work *work)
 {
@@ -256,6 +257,35 @@ static void pairing_process(struct k_work *work)
 	printk("Press Button 1 to confirm, Button 2 to reject.\n");
 }
 
+static void insert_conn_object(struct bt_conn *conn)
+{
+	for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
+	{
+		if (!conn_mode[i].conn)
+		{
+			conn_mode[i].conn = conn;
+			conn_mode[i].in_boot_mode = false;
+
+			return;
+		}
+	}
+
+	printk("Connection object could not be inserted %p\n", conn);
+}
+
+static bool is_conn_slot_free(void)
+{
+	for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
+	{
+		if (!conn_mode[i].conn)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
@@ -264,7 +294,15 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	if (err)
 	{
-		printk("Failed to connect to %s (%u)\n", addr, err);
+		if (err == BT_HCI_ERR_ADV_TIMEOUT)
+		{
+			printk("Direct advertising to %s timed out\n", addr);
+			k_work_submit(&adv_work);
+		}
+		else
+		{
+			printk("Failed to connect to %s (%u)\n", addr, err);
+		}
 		return;
 	}
 
@@ -278,33 +316,17 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		return;
 	}
 
-	for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
-	{
-		if (!conn_mode[i].conn)
-		{
-			conn_mode[i].conn = conn;
-			conn_mode[i].in_boot_mode = false;
-			break;
-		}
-	}
+	insert_conn_object(conn);
 
-#if CONFIG_NFC_OOB_PAIRING == 0
-	for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
+	if (is_conn_slot_free())
 	{
-		if (!conn_mode[i].conn)
-		{
-			advertising_start();
-			return;
-		}
+		advertising_start();
 	}
-#endif
-	is_adv = false;
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	int err;
-	bool is_any_dev_connected = false;
 	char addr[BT_ADDR_LE_STR_LEN];
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
@@ -323,29 +345,14 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		if (conn_mode[i].conn == conn)
 		{
 			conn_mode[i].conn = NULL;
-		}
-		else
-		{
-			if (conn_mode[i].conn)
-			{
-				is_any_dev_connected = true;
-			}
+			break;
 		}
 	}
 
-
-#if CONFIG_NFC_OOB_PAIRING
-	if (is_adv)
-	{
-		printk("Advertising stopped after disconnect\n");
-		bt_le_adv_stop();
-		is_adv = false;
-	}
-#else
 	advertising_start();
-#endif
 }
 
+#ifdef CONFIG_BT_HIDS_SECURITY_ENABLED
 static void security_changed(struct bt_conn *conn, bt_security_t level,
 							 enum bt_security_err err)
 {
@@ -363,45 +370,15 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 			   err);
 	}
 }
+#endif
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
+#ifdef CONFIG_BT_HIDS_SECURITY_ENABLED
 	.security_changed = security_changed,
+#endif
 };
-
-
-static void hids_outp_rep_handler(struct bt_hids_rep *rep,
-								  struct bt_conn *conn,
-								  bool write)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	if (!write)
-	{
-		printk("Output report read\n");
-		return;
-	};
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	printk("Output report has been received %s\n", addr);
-}
-
-static void hids_boot_kb_outp_rep_handler(struct bt_hids_rep *rep,
-										  struct bt_conn *conn,
-										  bool write)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	if (!write)
-	{
-		printk("Output report read\n");
-		return;
-	};
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	printk("Boot Keyboard Output report has been received %s\n", addr);
-}
 
 static void hids_pm_evt_handler(enum bt_hids_pm_evt evt,
 								struct bt_conn *conn)
@@ -419,7 +396,6 @@ static void hids_pm_evt_handler(enum bt_hids_pm_evt evt,
 
 	if (i >= CONFIG_BT_HIDS_MAX_CLIENT_COUNT)
 	{
-		printk("Cannot find connection handle when processing PM");
 		return;
 	}
 
@@ -445,122 +421,184 @@ static void hids_pm_evt_handler(enum bt_hids_pm_evt evt,
 static void hid_init(void)
 {
 	int err;
-	struct bt_hids_init_param hids_init_obj = {0};
+	struct bt_hids_init_param hids_init_param = {0};
 	struct bt_hids_inp_rep *hids_inp_rep;
-	struct bt_hids_outp_feat_rep *hids_outp_rep;
+	static const uint8_t mouse_movement_mask[ceiling_fraction(INPUT_REP_MOVEMENT_LEN, 8)] = {0};
 
 	static const uint8_t report_map[] = {
-		0x05,
-		0x01, /* Usage Page (Generic Desktop) */
-		0x09,
-		0x06, /* Usage (Keyboard) */
-		0xA1,
-		0x01, /* Collection (Application) */
+		0x05, 0x01, /* Usage Page (Generic Desktop) */
+		0x09, 0x02, /* Usage (Mouse) */
 
-	/* Keys */
-#if INPUT_REP_KEYS_REF_ID
-		0x85,
-		INPUT_REP_KEYS_REF_ID,
-#endif
-		0x05,
-		0x07, /* Usage Page (Key Codes) */
-		0x19,
-		0xe0, /* Usage Minimum (224) */
-		0x29,
-		0xe7, /* Usage Maximum (231) */
-		0x15,
-		0x00, /* Logical Minimum (0) */
-		0x25,
-		0x01, /* Logical Maximum (1) */
-		0x75,
-		0x01, /* Report Size (1) */
-		0x95,
-		0x08, /* Report Count (8) */
-		0x81,
-		0x02, /* Input (Data, Variable, Absolute) */
+		0xA1, 0x01, /* Collection (Application) */
 
-		0x95,
-		0x01, /* Report Count (1) */
-		0x75,
-		0x08, /* Report Size (8) */
-		0x81,
-		0x01, /* Input (Constant) reserved byte(1) */
+		/* Report ID 1: Mouse buttons + scroll/pan */
+		0x85, 0x01,		  /* Report Id 1 */
+		0x09, 0x01,		  /* Usage (Pointer) */
+		0xA1, 0x00,		  /* Collection (Physical) */
+		0x95, 0x05,		  /* Report Count (3) */
+		0x75, 0x01,		  /* Report Size (1) */
+		0x05, 0x09,		  /* Usage Page (Buttons) */
+		0x19, 0x01,		  /* Usage Minimum (01) */
+		0x29, 0x05,		  /* Usage Maximum (05) */
+		0x15, 0x00,		  /* Logical Minimum (0) */
+		0x25, 0x01,		  /* Logical Maximum (1) */
+		0x81, 0x02,		  /* Input (Data, Variable, Absolute) */
+		0x95, 0x01,		  /* Report Count (1) */
+		0x75, 0x03,		  /* Report Size (3) */
+		0x81, 0x01,		  /* Input (Constant) for padding */
+		0x75, 0x08,		  /* Report Size (8) */
+		0x95, 0x01,		  /* Report Count (1) */
+		0x05, 0x01,		  /* Usage Page (Generic Desktop) */
+		0x09, 0x38,		  /* Usage (Wheel) */
+		0x15, 0x81,		  /* Logical Minimum (-127) */
+		0x25, 0x7F,		  /* Logical Maximum (127) */
+		0x81, 0x06,		  /* Input (Data, Variable, Relative) */
+		0x05, 0x0C,		  /* Usage Page (Consumer) */
+		0x0A, 0x38, 0x02, /* Usage (AC Pan) */
+		0x95, 0x01,		  /* Report Count (1) */
+		0x81, 0x06,		  /* Input (Data,Value,Relative,Bit Field) */
+		0xC0,			  /* End Collection (Physical) */
 
-		0x95,
-		0x06, /* Report Count (6) */
-		0x75,
-		0x08, /* Report Size (8) */
-		0x15,
-		0x00, /* Logical Minimum (0) */
-		0x25,
-		0x65, /* Logical Maximum (101) */
-		0x05,
-		0x07, /* Usage Page (Key codes) */
-		0x19,
-		0x00, /* Usage Minimum (0) */
-		0x29,
-		0x65, /* Usage Maximum (101) */
-		0x81,
-		0x00, /* Input (Data, Array) Key array(6 bytes) */
+		/* Report ID 2: Mouse motion */
+		0x85, 0x02,		  /* Report Id 2 */
+		0x09, 0x01,		  /* Usage (Pointer) */
+		0xA1, 0x00,		  /* Collection (Physical) */
+		0x75, 0x0C,		  /* Report Size (12) */
+		0x95, 0x02,		  /* Report Count (2) */
+		0x05, 0x01,		  /* Usage Page (Generic Desktop) */
+		0x09, 0x30,		  /* Usage (X) */
+		0x09, 0x31,		  /* Usage (Y) */
+		0x16, 0x01, 0xF8, /* Logical maximum (2047) */
+		0x26, 0xFF, 0x07, /* Logical minimum (-2047) */
+		0x81, 0x06,		  /* Input (Data, Variable, Relative) */
+		0xC0,			  /* End Collection (Physical) */
+		0xC0,			  /* End Collection (Application) */
 
-	/* LED */
-#if OUTPUT_REP_KEYS_REF_ID
-		0x85,
-		OUTPUT_REP_KEYS_REF_ID,
-#endif
-		0x95,
-		0x05, /* Report Count (5) */
-		0x75,
-		0x01, /* Report Size (1) */
-		0x05,
-		0x08, /* Usage Page (Page# for LEDs) */
-		0x19,
-		0x01, /* Usage Minimum (1) */
-		0x29,
-		0x05, /* Usage Maximum (5) */
-		0x91,
-		0x02, /* Output (Data, Variable, Absolute), */
-		/* Led report */
-		0x95,
-		0x01, /* Report Count (1) */
-		0x75,
-		0x03, /* Report Size (3) */
-		0x91,
-		0x01, /* Output (Data, Variable, Absolute), */
-		/* Led report padding */
+		/* Report ID 3: Advanced buttons */
+		0x05, 0x0C, /* Usage Page (Consumer) */
+		0x09, 0x01, /* Usage (Consumer Control) */
+		0xA1, 0x01, /* Collection (Application) */
+		0x85, 0x03, /* Report Id (3) */
+		0x15, 0x00, /* Logical minimum (0) */
+		0x25, 0x01, /* Logical maximum (1) */
+		0x75, 0x01, /* Report Size (1) */
+		0x95, 0x01, /* Report Count (1) */
 
-		0xC0 /* End Collection (Application) */
+		0x09, 0xCD,		  /* Usage (Play/Pause) */
+		0x81, 0x06,		  /* Input (Data,Value,Relative,Bit Field) */
+		0x0A, 0x83, 0x01, /* Usage (Consumer Control Configuration) */
+		0x81, 0x06,		  /* Input (Data,Value,Relative,Bit Field) */
+		0x09, 0xB5,		  /* Usage (Scan Next Track) */
+		0x81, 0x06,		  /* Input (Data,Value,Relative,Bit Field) */
+		0x09, 0xB6,		  /* Usage (Scan Previous Track) */
+		0x81, 0x06,		  /* Input (Data,Value,Relative,Bit Field) */
+
+		0x09, 0xEA,		  /* Usage (Volume Down) */
+		0x81, 0x06,		  /* Input (Data,Value,Relative,Bit Field) */
+		0x09, 0xE9,		  /* Usage (Volume Up) */
+		0x81, 0x06,		  /* Input (Data,Value,Relative,Bit Field) */
+		0x0A, 0x25, 0x02, /* Usage (AC Forward) */
+		0x81, 0x06,		  /* Input (Data,Value,Relative,Bit Field) */
+		0x0A, 0x24, 0x02, /* Usage (AC Back) */
+		0x81, 0x06,		  /* Input (Data,Value,Relative,Bit Field) */
+		0xC0			  /* End Collection */
 	};
 
-	hids_init_obj.rep_map.data = report_map;
-	hids_init_obj.rep_map.size = sizeof(report_map);
+	hids_init_param.rep_map.data = report_map;
+	hids_init_param.rep_map.size = sizeof(report_map);
 
-	hids_init_obj.info.bcd_hid = BASE_USB_HID_SPEC_VERSION;
-	hids_init_obj.info.b_country_code = 0x00;
-	hids_init_obj.info.flags = (BT_HIDS_REMOTE_WAKE |
-								BT_HIDS_NORMALLY_CONNECTABLE);
+	hids_init_param.info.bcd_hid = BASE_USB_HID_SPEC_VERSION;
+	hids_init_param.info.b_country_code = 0x00;
+	hids_init_param.info.flags = (BT_HIDS_REMOTE_WAKE |
+								  BT_HIDS_NORMALLY_CONNECTABLE);
 
-	hids_inp_rep =
-		&hids_init_obj.inp_rep_group_init.reports[INPUT_REP_KEYS_IDX];
-	hids_inp_rep->size = INPUT_REPORT_KEYS_MAX_LEN;
-	hids_inp_rep->id = INPUT_REP_KEYS_REF_ID;
-	hids_init_obj.inp_rep_group_init.cnt++;
+	hids_inp_rep = &hids_init_param.inp_rep_group_init.reports[0];
+	hids_inp_rep->size = INPUT_REP_BUTTONS_LEN;
+	hids_inp_rep->id = INPUT_REP_REF_BUTTONS_ID;
+	hids_init_param.inp_rep_group_init.cnt++;
 
-	hids_outp_rep =
-		&hids_init_obj.outp_rep_group_init.reports[OUTPUT_REP_KEYS_IDX];
-	hids_outp_rep->size = OUTPUT_REPORT_MAX_LEN;
-	hids_outp_rep->id = OUTPUT_REP_KEYS_REF_ID;
-	hids_outp_rep->handler = hids_outp_rep_handler;
-	hids_init_obj.outp_rep_group_init.cnt++;
+	hids_inp_rep++;
+	hids_inp_rep->size = INPUT_REP_MOVEMENT_LEN;
+	hids_inp_rep->id = INPUT_REP_REF_MOVEMENT_ID;
+	hids_inp_rep->rep_mask = mouse_movement_mask;
+	hids_init_param.inp_rep_group_init.cnt++;
 
-	hids_init_obj.is_kb = true;
-	hids_init_obj.boot_kb_outp_rep_handler = hids_boot_kb_outp_rep_handler;
-	hids_init_obj.pm_evt_handler = hids_pm_evt_handler;
+	hids_inp_rep++;
+	hids_inp_rep->size = INPUT_REP_MEDIA_PLAYER_LEN;
+	hids_inp_rep->id = INPUT_REP_REF_MPLAYER_ID;
+	hids_init_param.inp_rep_group_init.cnt++;
 
-	err = bt_hids_init(&hids_obj, &hids_init_obj);
+	hids_init_param.is_mouse = true;
+	hids_init_param.pm_evt_handler = hids_pm_evt_handler;
+
+	err = bt_hids_init(&hids_obj, &hids_init_param);
 	__ASSERT(err == 0, "HIDS initialization failed\n");
 }
 
+static void mouse_movement_send(int16_t x_delta, int16_t y_delta)
+{
+	for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
+	{
+
+		if (!conn_mode[i].conn)
+		{
+			continue;
+		}
+
+		if (conn_mode[i].in_boot_mode)
+		{
+			x_delta = MAX(MIN(x_delta, SCHAR_MAX), SCHAR_MIN);
+			y_delta = MAX(MIN(y_delta, SCHAR_MAX), SCHAR_MIN);
+			// printk("x_delta : %d  y_delta : %d \n",x_delta,y_delta);
+
+			bt_hids_boot_mouse_inp_rep_send(&hids_obj,
+											conn_mode[i].conn,
+											NULL,
+											(int8_t)x_delta,
+											(int8_t)y_delta,
+											NULL);
+		}
+		else
+		{
+			uint8_t x_buff[2];
+			uint8_t y_buff[2];
+			uint8_t buffer[INPUT_REP_MOVEMENT_LEN];
+
+			int16_t x = MAX(MIN(x_delta, 0x07ff), -0x07ff);
+			int16_t y = MAX(MIN(y_delta, 0x07ff), -0x07ff);
+			// printk("x_delta : %d  y_delta : %d \n",x,y);
+
+			/* Convert to little-endian. */
+			sys_put_le16(x, x_buff);
+			sys_put_le16(y, y_buff);
+
+			/* Encode report. */
+			BUILD_ASSERT(sizeof(buffer) == 3,
+						 "Only 2 axis, 12-bit each, are supported");
+
+			buffer[0] = x_buff[0];
+			buffer[1] = (y_buff[0] << 4) | (x_buff[1] & 0x0f);
+			buffer[2] = (y_buff[1] << 4) | (y_buff[0] >> 4);
+			
+
+			bt_hids_inp_rep_send(&hids_obj, conn_mode[i].conn,
+								 INPUT_REP_MOVEMENT_INDEX,
+								 buffer, sizeof(buffer), NULL);
+		}
+	}
+}
+
+static void mouse_handler(struct k_work *work)
+{
+	struct mouse_pos pos;
+
+	while (!k_msgq_get(&hids_queue, &pos, K_NO_WAIT))
+	{
+		mouse_movement_send(pos.x_val, pos.y_val);
+	}
+}
+
+#if defined(CONFIG_BT_HIDS_SECURITY_ENABLED)
 static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
@@ -606,40 +644,6 @@ static void auth_cancel(struct bt_conn *conn)
 	printk("Pairing cancelled: %s\n", addr);
 }
 
-#if CONFIG_NFC_OOB_PAIRING
-static void auth_oob_data_request(struct bt_conn *conn,
-								  struct bt_conn_oob_info *info)
-{
-	int err;
-	struct bt_le_oob *oob_local = app_nfc_oob_data_get();
-
-	printk("LESC OOB data requested\n");
-
-	if (info->type != BT_CONN_OOB_LE_SC)
-	{
-		printk("Only LESC pairing supported\n");
-		return;
-	}
-
-	if (info->lesc.oob_config != BT_CONN_OOB_LOCAL_ONLY)
-	{
-		printk("LESC OOB config not supported\n");
-		return;
-	}
-
-	/* Pass only local OOB data. */
-	err = bt_le_oob_set_sc_data(conn, &oob_local->le_sc_data, NULL);
-	if (err)
-	{
-		printk("Error while setting OOB data: %d\n", err);
-	}
-	else
-	{
-		printk("Successfully provided LESC OOB data\n");
-	}
-}
-#endif
-
 static void pairing_complete(struct bt_conn *conn, bool bonded)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
@@ -674,211 +678,15 @@ static struct bt_conn_auth_cb conn_auth_callbacks = {
 	.passkey_display = auth_passkey_display,
 	.passkey_confirm = auth_passkey_confirm,
 	.cancel = auth_cancel,
-#if CONFIG_NFC_OOB_PAIRING
-	.oob_data_request = auth_oob_data_request,
-#endif
 };
 
 static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
 	.pairing_complete = pairing_complete,
 	.pairing_failed = pairing_failed};
-
-/** @brief Function process keyboard state and sends it
- *
- *  @param pstate     The state to be sent
- *  @param boot_mode  Information if boot mode protocol is selected.
- *  @param conn       Connection handler
- *
- *  @return 0 on success or negative error code.
- */
-static int key_report_con_send(const struct keyboard_state *state,
-							   bool boot_mode,
-							   struct bt_conn *conn)
-{
-	int err = 0;
-	uint8_t data[INPUT_REPORT_KEYS_MAX_LEN];
-	uint8_t *key_data;
-	const uint8_t *key_state;
-	size_t n;
-
-	data[0] = state->ctrl_keys_state;
-	data[1] = 0;
-	key_data = &data[2];
-	key_state = state->keys_state;
-
-	for (n = 0; n < KEY_PRESS_MAX; ++n)
-	{
-		*key_data++ = *key_state++;
-	}
-	if (boot_mode)
-	{
-		err = bt_hids_boot_kb_inp_rep_send(&hids_obj, conn, data,
-										   sizeof(data), NULL);
-	}
-	else
-	{
-		err = bt_hids_inp_rep_send(&hids_obj, conn,
-								   INPUT_REP_KEYS_IDX, data,
-								   sizeof(data), NULL);
-	}
-	return err;
-}
-
-/** @brief Function process and send keyboard state to all active connections
- *
- * Function process global keyboard state and send it to all connected
- * clients.
- *
- * @return 0 on success or negative error code.
- */
-static int key_report_send(void)
-{
-	for (size_t i = 0; i < CONFIG_BT_HIDS_MAX_CLIENT_COUNT; i++)
-	{
-		if (conn_mode[i].conn)
-		{
-			int err;
-
-			err = key_report_con_send(&hid_keyboard_state,
-									  conn_mode[i].in_boot_mode,
-									  conn_mode[i].conn);
-			if (err)
-			{
-				printk("Key report send error: %d\n", err);
-				return err;
-			}
-		}
-	}
-	return 0;
-}
-
-/** @brief Change key code to ctrl code mask
- *
- *  Function changes the key code to the mask in the control code
- *  field inside the raport.
- *  Returns 0 if key code is not a control key.
- *
- *  @param key Key code
- *
- *  @return Mask of the control key or 0.
- */
-static uint8_t button_ctrl_code(uint8_t key)
-{
-	if (KEY_CTRL_CODE_MIN <= key && key <= KEY_CTRL_CODE_MAX)
-	{
-		return (uint8_t)(1U << (key - KEY_CTRL_CODE_MIN));
-	}
-	return 0;
-}
-
-static int hid_kbd_state_key_set(uint8_t key)
-{
-	uint8_t ctrl_mask = button_ctrl_code(key);
-
-	if (ctrl_mask)
-	{
-		hid_keyboard_state.ctrl_keys_state |= ctrl_mask;
-		return 0;
-	}
-	
-	for (size_t i = 0; i < KEY_PRESS_MAX; ++i)
-	{
-		if (hid_keyboard_state.keys_state[i] == 0)
-		{
-			hid_keyboard_state.keys_state[i] = key;
-			return 0;
-		}
-	}
-	/* All slots busy */
-	return -EBUSY;
-}
-
-static int hid_kbd_state_key_clear(uint8_t key)
-{
-	uint8_t ctrl_mask = button_ctrl_code(key);
-
-	if (ctrl_mask)
-	{
-		hid_keyboard_state.ctrl_keys_state &= ~ctrl_mask;
-		return 0;
-	}
-	for (size_t i = 0; i < KEY_PRESS_MAX; ++i)
-	{
-		if (hid_keyboard_state.keys_state[i] == key)
-		{
-			hid_keyboard_state.keys_state[i] = 0;
-			return 0;
-		}
-	}
-	/* Key not found */
-	return -EINVAL;
-}
-
-/** @brief Press a button and send report
- *
- *  @note Functions to manipulate hid state are not reentrant
- *  @param keys
- *  @param cnt
- *
- *  @return 0 on success or negative error code.
- */
-static int hid_buttons_press(const uint8_t *keys, size_t cnt)
-{
-	while (cnt--)
-	{
-		int err;
-
-		err = hid_kbd_state_key_set(*keys++);
-		if (err)
-		{
-			printk("Cannot set selected key.\n");
-			return err;
-		}
-	}
-
-	return key_report_send();
-}
-
-/** @brief Release the button and send report
- *
- *  @note Functions to manipulate hid state are not reentrant
- *  @param keys
- *  @param cnt
- *
- *  @return 0 on success or negative error code.
- */
-static int hid_buttons_release(const uint8_t *keys, size_t cnt)
-{
-	while (cnt--)
-	{
-		int err;
-
-		err = hid_kbd_state_key_clear(*keys++);
-		if (err)
-		{
-			printk("Cannot clear selected key.\n");
-			return err;
-		}
-	}
-
-	return key_report_send();
-}
-
-// static void key_pressed(const uint8_t *chr, bool is_shift_key)
-static void key_pressed(const uint8_t *chr)
-{
-	// if (is_shift_key)
-	// {
-	// 	hid_buttons_press(shift_key, 1);
-	// }
-	hid_buttons_press(chr, 1);
-	hid_buttons_release(chr, 1);
-	// if (is_shift_key)
-	// {
-	// 	hid_buttons_release(shift_key, 1);
-	// }
-}
-
+#else
+static struct bt_conn_auth_cb conn_auth_callbacks;
+static struct bt_conn_auth_info_cb conn_auth_info_callbacks;
+#endif /* defined(CONFIG_BT_HIDS_SECURITY_ENABLED) */
 
 static void num_comp_reply(bool accept)
 {
@@ -911,21 +719,18 @@ static void num_comp_reply(bool accept)
 	}
 }
 
-static void button_changed(uint32_t button_state, uint32_t has_changed)
+void button_changed(uint32_t button_state, uint32_t has_changed)
 {
-	static bool pairing_button_pressed;
-
+	// bool data_to_send = true;
+	// struct mouse_pos pos;
 	uint32_t buttons = button_state & has_changed;
 
-	printk("button_state %d\n", button_state);
-	printk("has_changed %d\n", has_changed);
-	printk("buttons %d\n", buttons);
+	// memset(&pos, 0, sizeof(struct mouse_pos));
 
 	if (k_msgq_num_used_get(&mitm_queue))
 	{
 		if (buttons & KEY_PAIRING_ACCEPT)
 		{
-			pairing_button_pressed = true;
 			num_comp_reply(true);
 
 			return;
@@ -933,34 +738,160 @@ static void button_changed(uint32_t button_state, uint32_t has_changed)
 
 		if (buttons & KEY_PAIRING_REJECT)
 		{
-			pairing_button_pressed = true;
 			num_comp_reply(false);
 
 			return;
 		}
 	}
 
-	/* Do not take any action if the pairing button is released. */
-	if (pairing_button_pressed &&
-		(has_changed & (KEY_PAIRING_ACCEPT | KEY_PAIRING_REJECT)))
-	{
-		pairing_button_pressed = false;
-
-		return;
-	}
-
-
-
-	// if (UP_ARROW & has_changed)
-	// {
-	// 	key_pressed((button_state & UP_ARROW) != 0);
+	// if (buttons & KEY_LEFT_MASK) {
+	// 	pos.x_val -= MOVEMENT_SPEED;
+	// 	printk("%s(): left\n", __func__);
+	// 	data_to_send = true;
+	// }
+	// if (buttons & KEY_UP_MASK) {
+	// 	pos.y_val -= MOVEMENT_SPEED;
+	// 	printk("%s(): up\n", __func__);
+	// 	data_to_send = true;
+	// }
+	// if (buttons & KEY_RIGHT_MASK) {
+	// 	pos.x_val += MOVEMENT_SPEED;
+	// 	printk("%s(): right\n", __func__);
+	// 	data_to_send = true;
+	// }
+	// if (buttons & KEY_DOWN_MASK) {
+	// 	pos.y_val += MOVEMENT_SPEED;
+	// 	printk("%s(): down\n", __func__);
+	// 	data_to_send = true;
 	// }
 
+	// if (data_to_send) {
+	// 	int err;
 
-
+	// 	err = k_msgq_put(&hids_queue, &pos, K_NO_WAIT);
+	// 	if (err) {
+	// 		printk("No space in the queue for button pressed\n");
+	// 		return;
+	// 	}
+	// 	if (k_msgq_num_used_get(&hids_queue) == 1) {
+	// 		k_work_submit(&hids_work);
+	// 	}
+	// }
 }
 
-static void configure_gpio(void)
+// void accelerometer_mouse(uint16_t x_axix,uint16_t y_axix)
+// {
+// 	bool data_to_send = true;
+// 	struct mouse_pos pos;
+// 	memset(&pos, 0, sizeof(struct mouse_pos));
+
+// 	if (left) {
+// 		pos.x_val -= x_axix;
+// 		// printk("%s(): left\n", __func__);
+// 		data_to_send = true;
+// 	}
+// 	if (up) {
+// 		pos.y_val -= y_axix;
+// 		// printk("%s(): up\n", __func__);
+// 		data_to_send = true;
+// 	}
+// 	if (right) {
+// 		pos.x_val += x_axix;
+// 		// printk("%s(): right\n", __func__);
+// 		data_to_send = true;
+// 	}
+// 	if (down) {
+// 		pos.y_val += y_axix;
+// 		// printk("%s(): down\n", __func__);
+// 		data_to_send = true;
+// 	}
+
+// 	if (data_to_send) {
+// 		int err;
+
+// 		err = k_msgq_put(&hids_queue, &pos, K_NO_WAIT);
+// 		if (err) {
+// 			printk("No space in the queue for button pressed\n");
+// 			return;
+// 		}
+// 		if (k_msgq_num_used_get(&hids_queue) == 1) {
+// 			k_work_submit(&hids_work);
+// 		}
+// 	}
+// }
+
+void accelerometer_mouse(uint16_t x_axix, uint16_t y_axix)
+{
+	bool data_to_send = true;
+	struct mouse_pos pos;
+	memset(&pos, 0, sizeof(struct mouse_pos));
+
+		static uint16_t prev_x=0, prev_y=0;
+
+	if (prev_x!=x_axix)
+	{
+		// pos.x_val = (abs(prev_x-x_axix))>20?(prev_x-x_axix)/1.5:0;
+		pos.x_val = (prev_x-x_axix)/1.5;
+		// x_val_def = abs(prev_x-x_axix);
+		// printk("%d: left\n", pos.x_val);
+		// if(flag)
+		// {
+		// 	x_val_def = (prev_x-x_axix)/1.5;
+		// 	pos.x_val = x_val_def;
+		// 	printk("%d: left\n", pos.x_val);
+		// }
+		data_to_send = true;
+	}
+	if (prev_y!=y_axix)
+	{
+		// pos.y_val = (abs(prev_y-y_axix))>20?(prev_y-y_axix)/1.5:0;
+		pos.y_val = (prev_y-y_axix)/1.5;
+		// y_val_def = abs(prev_y-y_axix);
+		// printk("%d: up\n", pos.y_val);
+		// if(flag)
+		// {
+		// 	y_val_def = (prev_y-y_axix)/1.5;
+		// 	pos.y_val = y_val_def;
+		// 	printk("%d: up\n", pos.y_val);
+		// }
+		data_to_send = true;
+	}
+
+	//--
+
+	prev_x = x_axix;
+	prev_y = y_axix;
+		//--
+
+		// if (right) {
+		// 	pos.x_val = x_axix;
+		// 	printk("%d: right\n", pos.x_val);
+		// 	data_to_send = true;
+		// }
+		// if (down) {
+		// 	pos.y_val = y_axix;
+		// 	printk("%d: down\n", pos.y_val);
+		// 	data_to_send = true;
+		// }
+
+		if (data_to_send)
+	{
+		int err;
+
+		err = k_msgq_put(&hids_queue, &pos, K_NO_WAIT);
+		if (err)
+		{
+			printk("No space in the queue for button pressed\n");
+			return;
+		}
+		if (k_msgq_num_used_get(&hids_queue) == 1)
+		{
+			k_work_submit(&hids_work);
+		}
+	}
+}
+
+void configure_buttons(void)
 {
 	int err;
 
@@ -968,12 +899,6 @@ static void configure_gpio(void)
 	if (err)
 	{
 		printk("Cannot init buttons (err: %d)\n", err);
-	}
-
-	err = dk_leds_init();
-	if (err)
-	{
-		printk("Cannot init LEDs (err: %d)\n", err);
 	}
 }
 
@@ -991,47 +916,27 @@ static void bas_notify(void)
 	bt_bas_set_battery_level(battery_level);
 }
 
-void tcp_work_handler(struct k_work *work)
-{
-	/* do the processing that needs to be done periodically */
-	si7006();
-	ble_temp = cTemp * 100;
-	ble_hum = humidity * 100;
-	hum_notify();
-	temp_notify();
-}
-
-K_WORK_DEFINE(tcp_work, tcp_work_handler);
-void tcp_timer_handler(struct k_timer *dummy)
-{
-	k_work_submit(&tcp_work);
-}
-
-struct k_timer tcp_timer;
-
-
-
 void main(void)
 {
 	int err;
-	int blink_status = 0;
 
-	printk("Starting Bluetooth Peripheral HIDS keyboard example\n");
+	printk("Starting Bluetooth Peripheral HIDS mouse example\n");
 
-	configure_gpio();
-
-	err = bt_conn_auth_cb_register(&conn_auth_callbacks);
-	if (err)
+	if (IS_ENABLED(CONFIG_BT_HIDS_SECURITY_ENABLED))
 	{
-		printk("Failed to register authorization callbacks.\n");
-		return;
-	}
+		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
+		if (err)
+		{
+			printk("Failed to register authorization callbacks.\n");
+			return;
+		}
 
-	err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
-	if (err)
-	{
-		printk("Failed to register authorization info callbacks.\n");
-		return;
+		err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+		if (err)
+		{
+			printk("Failed to register authorization info callbacks.\n");
+			return;
+		}
 	}
 
 	err = bt_enable(NULL);
@@ -1043,52 +948,45 @@ void main(void)
 
 	printk("Bluetooth initialized\n");
 
+	/* DIS initialized at system boot with SYS_INIT macro. */
 	hid_init();
+
+	k_work_init(&hids_work, mouse_handler);
+	k_work_init(&pairing_work, pairing_process);
+	k_work_init(&adv_work, advertising_process);
 
 	if (IS_ENABLED(CONFIG_SETTINGS))
 	{
 		settings_load();
 	}
 
-#if CONFIG_NFC_OOB_PAIRING
-	k_work_init(&adv_work, delayed_advertising_start);
-	app_nfc_init();
-#else
 	advertising_start();
-#endif
 
-	k_work_init(&pairing_work, pairing_process);
-	keypad_init();
-	colour();
-	
-	
-	k_timer_init(&tcp_timer, tcp_timer_handler, NULL);
-	k_timer_start(&tcp_timer, K_SECONDS(0), K_SECONDS(timer_val));
-	for (;;)
+	configure_buttons();
+	accelero_main();
+
+	while (1)
 	{
-	bas_notify();
-	RGB_DATA_FOR_READ();
-	k_sleep(K_MSEC(1000));
-	clear_notify();
-	green_notify();
-	blue_notify();
-	red_notify();
-	dac_main();
-	k_sleep(K_MSEC(3000));
-	if(cond == 1)
-	{	
-		// printf("entered for loop");
-		cond =0;
-		uint8_t key = keypress();
-		if(key)
-		{
-			// key_pressed(&key, (key == hash) ? true : false);
-			key_pressed(&key);
-		}
-		kp_i2c_write(0x34, 0x02, 0x01);
+		// k_sleep(K_SECONDS(1));
+		accele_fun(&x_axis,&y_axis);
+
+		x_value = x_axis;
+		y_value = y_axis;
+		// if (x_value <= 3000)
+		// {
+		// x_value = abs(x_value - 4100);
+		// }
+
+		// if (y_value <= 3000)
+		// {
+		// y_value =abs( y_value -4100);
+		// }
+		// printk("x_value : %d  y_value : %d \n",x_value,y_value);
+		mouse_value(&x_value,&y_value);
+		// printk("x_value : %d  y_value : %d \n",x_value,y_value);
+		accelerometer_mouse(x_value,y_value);
+		/* Battery level simulation */
+		bas_notify();
+		k_sleep(K_MSEC(50));
 	}
-	
-		
-		k_sleep(K_MSEC(10));
-	}
-	} 
+}

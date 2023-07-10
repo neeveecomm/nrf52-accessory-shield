@@ -6,16 +6,18 @@
 
 source "Kconfig.zephyr"
 
-menu "Nordic BLE HIDS Keyboard sample"
+menu "Nordic HIDS BLE GATT mouse service sample"
 
-config NFC_OOB_PAIRING
-	bool "Enable NFC OOB pairing"
-	depends on HAS_HW_NRF_NFCT
+config BT_HIDS_SECURITY_ENABLED
+	bool "Enable security"
 	default y
-	select NFC_T2T_NRFXLIB
-	select NFC_NDEF
-	select NFC_NDEF_MSG
-	select NFC_NDEF_RECORD
-	select NFC_NDEF_LE_OOB_REC
+	select BT_SMP
+	help
+	  "Enable BLE security for the HIDS service"
+
+config BT_DIRECTED_ADVERTISING
+	bool "Enable directed advertising"
+	default y
+	select BT_PRIVACY
 
 endmenu
